@@ -254,7 +254,7 @@ module.exports = async function handler(req, res) {
   // /meta/:type/:id.json
   const metaM = path.match(/^\/meta\/([^/]+)\/(.+)\.json$/);
   if (metaM) {
-    const [, , id] = metaM;
+    const id = decodeURIComponent(metaM[2]);
     console.log("[meta requested]", id);
     if (!id.startsWith("al:")) {
       console.log("[meta] skipping — not our prefix");
