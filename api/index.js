@@ -1,51 +1,38 @@
 // ============================================================
 //  Stremio Addon – Anime Catalog (via AniList API)
-//  Vercel Serverless Function — v1.2 diagnostic fix
+//  Vercel Serverless Function — v1.3 multi-season
 // ============================================================
 
 const MANIFEST = {
   id: "community.animecrunchyroll.catalog",
-  version: "1.2.0",
+  version: "1.3.0",
   name: "Crunchyroll Anime",
-  description: "Katalog anime – tytuły, okładki i odcinki.",
+  description: "Katalog anime – tytuły, okładki, wszystkie sezony i odcinki.",
   logo: "https://www.crunchyroll.com/build/assets/img/favicons/favicon-96x96.png",
   resources: [
     "catalog",
-    {
-      name: "meta",
-      types: ["series"],
-      idPrefixes: ["al:"],
-    },
+    { name: "meta", types: ["series"], idPrefixes: ["al:"] },
   ],
   types: ["series"],
   idPrefixes: ["al:"],
   catalogs: [
     {
-      type: "series",
-      id: "anime-popular",
-      name: "🔥 Popularne Anime",
-      extra: [
-        { name: "search", isRequired: false },
-        { name: "skip",   isRequired: false },
-      ],
+      type: "series", id: "anime-popular", name: "🔥 Popularne Anime",
+      extra: [{ name: "search", isRequired: false }, { name: "skip", isRequired: false }],
     },
     {
-      type: "series",
-      id: "anime-seasonal",
-      name: "📅 Sezonowe Anime",
+      type: "series", id: "anime-seasonal", name: "📅 Sezonowe Anime",
       extra: [{ name: "skip", isRequired: false }],
     },
     {
-      type: "series",
-      id: "anime-toprated",
-      name: "⭐ Najwyżej Oceniane",
+      type: "series", id: "anime-toprated", name: "⭐ Najwyżej Oceniane",
       extra: [{ name: "skip", isRequired: false }],
     },
   ],
   behaviorHints: { adult: false },
 };
 
-// ── AniList ──────────────────────────────────────────────────
+// ── AniList helper ───────────────────────────────────────────
 const ANILIST_URL = "https://graphql.anilist.co";
 
 async function anilistQuery(query, variables) {
@@ -60,6 +47,7 @@ async function anilistQuery(query, variables) {
   return json.data;
 }
 
+// ── Fields ───────────────────────────────────────────────────
 const FIELDS = `
   id
   title { romaji english native }
@@ -70,9 +58,22 @@ const FIELDS = `
   averageScore
   episodes
   status
+  format
 `;
 
-// ── toMeta — ID prefix zmieniony na "al:" ───────────────────
+const RELATION_FIELDS = `
+  id
+  title { romaji english native }
+  type
+  format
+  episodes
+  startDate { year month day }
+  status
+  streamingEpisodes { title thumbnail url site }
+  airingSchedule(notYetAired:false, perPage:150) { nodes { episode airingAt } }
+`;
+
+// ── toMeta ───────────────────────────────────────────────────
 function toMeta(media) {
   return {
     id: `al:${media.id}`,
@@ -88,17 +89,10 @@ function toMeta(media) {
 
 // ── Catalog fetchers ─────────────────────────────────────────
 async function fetchPopular(page, search) {
-  if (search) {
-    const d = await anilistQuery(
-      `query($s:String,$p:Int){Page(page:$p,perPage:20){media(search:$s,type:ANIME,isAdult:false,sort:POPULARITY_DESC){${FIELDS}}}}`,
-      { s: search, p: page }
-    );
-    return d.Page.media;
-  }
-  const d = await anilistQuery(
-    `query($p:Int){Page(page:$p,perPage:20){media(type:ANIME,isAdult:false,sort:POPULARITY_DESC){${FIELDS}}}}`,
-    { p: page }
-  );
+  const q = search
+    ? `query($s:String,$p:Int){Page(page:$p,perPage:20){media(search:$s,type:ANIME,isAdult:false,sort:POPULARITY_DESC){${FIELDS}}}}`
+    : `query($p:Int){Page(page:$p,perPage:20){media(type:ANIME,isAdult:false,sort:POPULARITY_DESC){${FIELDS}}}}`;
+  const d = await anilistQuery(q, search ? { s: search, p: page } : { p: page });
   return d.Page.media;
 }
 
@@ -121,58 +115,93 @@ async function fetchTopRated(page) {
   return d.Page.media;
 }
 
-// ── buildMeta ────────────────────────────────────────────────
-async function buildMeta(rawId) {
-  // rawId = "al:12345"
-  const anilistId = parseInt(rawId.replace("al:", ""), 10);
-  if (isNaN(anilistId)) throw new Error("Invalid ID: " + rawId);
+// ── Zbierz cały łańcuch serii (S1→S2→S3→filmy) ──────────────
+// Przechodzi przez SEQUEL/PREQUEL rekurencyjnie, zwraca posortowaną listę
+async function collectAllParts(rootId) {
+  // Najpierw znajdź najstarszą część (idź przez PREQUEL do początku)
+  const visited = new Set();
+  const allMedia = new Map(); // id → media
 
-  const d = await anilistQuery(
-    `query($id:Int){Media(id:$id,type:ANIME){
-      ${FIELDS}
-      description(asHtml:false)
-      streamingEpisodes { title thumbnail url site }
-      airingSchedule(notYetAired:false,perPage:150){ nodes{ episode airingAt } }
-    }}`,
-    { id: anilistId }
-  );
+  async function fetchWithRelations(id) {
+    if (visited.has(id)) return;
+    visited.add(id);
 
-  const media = d.Media;
-  const meta = toMeta(media);
+    const d = await anilistQuery(
+      `query($id:Int){Media(id:$id,type:ANIME){
+        ${RELATION_FIELDS}
+        relations {
+          edges {
+            relationType
+            node { id type format title { romaji english } }
+          }
+        }
+      }}`,
+      { id }
+    );
 
-  if (media.description) {
-    meta.description = media.description.replace(/<[^>]*>/g, "").slice(0, 400);
+    const media = d.Media;
+    allMedia.set(id, media);
+
+    // Zbierz SEQUEL i PREQUEL (tylko ANIME)
+    const related = (media.relations?.edges || []).filter(e =>
+      (e.relationType === "SEQUEL" || e.relationType === "PREQUEL") &&
+      e.node.type === "ANIME"
+    );
+
+    // Limit: max 15 części żeby nie zapętlić się w długich franczyzach
+    if (allMedia.size < 15) {
+      await Promise.all(
+        related.map(e => fetchWithRelations(e.node.id))
+      );
+    }
   }
 
-  // airing date map
+  await fetchWithRelations(rootId);
+
+  // Posortuj chronologicznie po dacie startu
+  const sorted = Array.from(allMedia.values()).sort((a, b) => {
+    const da = a.startDate?.year ? new Date(`${a.startDate.year}-${String(a.startDate.month||1).padStart(2,'0')}-01`) : new Date(0);
+    const db = b.startDate?.year ? new Date(`${b.startDate.year}-${String(b.startDate.month||1).padStart(2,'0')}-01`) : new Date(0);
+    return da - db;
+  });
+
+  return sorted;
+}
+
+// ── Zbuduj listę odcinków dla jednej części ──────────────────
+function buildEpisodesForPart(media, seasonNum) {
   const airMap = {};
-  (media.airingSchedule?.nodes || []).forEach((n) => {
+  (media.airingSchedule?.nodes || []).forEach(n => {
     airMap[n.episode] = new Date(n.airingAt * 1000).toISOString();
   });
 
   const baseDate = media.startDate?.year
-    ? new Date(`${media.startDate.year}-${String(media.startDate.month || 1).padStart(2,"0")}-${String(media.startDate.day || 1).padStart(2,"0")}`)
+    ? new Date(`${media.startDate.year}-${String(media.startDate.month||1).padStart(2,'0')}-${String(media.startDate.day||1).padStart(2,'0')}`)
     : new Date("2000-01-01");
 
   function epDate(num) {
     if (airMap[num]) return airMap[num];
-    const d2 = new Date(baseDate);
-    d2.setDate(d2.getDate() + (num - 1) * 7);
-    return d2.toISOString();
+    const d = new Date(baseDate);
+    d.setDate(d.getDate() + (num - 1) * 7);
+    return d.toISOString();
   }
 
-  const videos = [];
   const seList = media.streamingEpisodes || [];
+  const videos = [];
+
+  // Nazwa sezonu (np. "Sezon 2", "Film: Mugen Train")
+  const isMovie = media.format === "MOVIE";
+  const partTitle = media.title.english || media.title.romaji || media.title.native;
 
   if (seList.length > 0) {
     seList.forEach((ep, idx) => {
       const num = idx + 1;
       videos.push({
-        id:       `al:${media.id}:1:${num}`,
-        title:    ep.title || `Odcinek ${num}`,
-        season:   1,
-        episode:  num,      // Stremio spec używa "episode" nie "number"
-        released: epDate(num),
+        id:        `al:${media.id}:${seasonNum}:${num}`,
+        title:     ep.title || (isMovie ? partTitle : `Odcinek ${num}`),
+        season:    seasonNum,
+        episode:   num,
+        released:  epDate(num),
         thumbnail: ep.thumbnail || undefined,
         ...(ep.site === "Crunchyroll" ? { externalUrl: ep.url } : {}),
       });
@@ -180,29 +209,64 @@ async function buildMeta(rawId) {
   } else if (media.episodes > 0) {
     for (let i = 1; i <= media.episodes; i++) {
       videos.push({
-        id:       `al:${media.id}:1:${i}`,
-        title:    `Odcinek ${i}`,
-        season:   1,
+        id:       `al:${media.id}:${seasonNum}:${i}`,
+        title:    isMovie && i === 1 ? partTitle : `Odcinek ${i}`,
+        season:   seasonNum,
         episode:  i,
         released: epDate(i),
       });
     }
   } else {
-    // still airing / unknown count
+    // Nieznana liczba odcinków (np. trwa emisja)
     videos.push({
-      id:       `al:${media.id}:1:1`,
-      title:    "Odcinek 1",
-      season:   1,
+      id:       `al:${media.id}:${seasonNum}:1`,
+      title:    isMovie ? partTitle : "Odcinek 1",
+      season:   seasonNum,
       episode:  1,
       released: baseDate.toISOString(),
     });
   }
 
-  meta.videos = videos;
+  return videos;
+}
+
+// ── buildMeta — główny handler ───────────────────────────────
+async function buildMeta(rawId) {
+  const anilistId = parseInt(rawId.replace("al:", ""), 10);
+  if (isNaN(anilistId)) throw new Error("Invalid ID: " + rawId);
+
+  // Pobierz wszystkie powiązane części (sezony + filmy)
+  const parts = await collectAllParts(anilistId);
+
+  // Użyj pierwszej części jako bazy dla metadanych
+  const root = parts[0];
+  const meta = toMeta(root);
+
+  // Jeśli jest tylko jedna część — prosta lista odcinków
+  if (parts.length === 1) {
+    meta.videos = buildEpisodesForPart(root, 1);
+    return meta;
+  }
+
+  // Wiele części — każda = osobny sezon w Stremio
+  const allVideos = [];
+  parts.forEach((part, idx) => {
+    const seasonNum = idx + 1;
+    const eps = buildEpisodesForPart(part, seasonNum);
+    allVideos.push(...eps);
+  });
+
+  meta.videos = allVideos;
+
+  // Dodaj opis z głównej części
+  if (root.description) {
+    meta.description = root.description.replace(/<[^>]*>/g, "").slice(0, 400);
+  }
+
   return meta;
 }
 
-// ── Routing helpers ──────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────
 function cors(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "*");
@@ -210,15 +274,14 @@ function cors(res) {
   res.setHeader("Cache-Control", "max-age=300, stale-while-revalidate=600");
 }
 
-function parseExtra(segment) {
-  if (!segment) return {};
-  const clean = segment.replace(/\.json$/, "");
+function parseExtra(seg) {
+  if (!seg) return {};
   const out = {};
-  new URLSearchParams(clean).forEach((v, k) => { out[k] = decodeURIComponent(v); });
+  new URLSearchParams(seg.replace(/\.json$/, "")).forEach((v, k) => { out[k] = decodeURIComponent(v); });
   return out;
 }
 
-// ── Main handler ─────────────────────────────────────────────
+// ── Main Vercel handler ───────────────────────────────────────
 module.exports = async function handler(req, res) {
   cors(res);
   if (req.method === "OPTIONS") return res.status(200).end();
@@ -235,10 +298,9 @@ module.exports = async function handler(req, res) {
   const catM = path.match(/^\/catalog\/([^/]+)\/([^/]+?)(?:\/(.+))?\.json$/);
   if (catM) {
     const [, , catalogId, extraSeg] = catM;
-    const extra = parseExtra(extraSeg || "");
-    const page  = Math.floor((parseInt(extra.skip || "0", 10) || 0) / 20) + 1;
+    const extra  = parseExtra(extraSeg || "");
+    const page   = Math.floor((parseInt(extra.skip || "0", 10) || 0) / 20) + 1;
     const search = extra.search || null;
-
     try {
       let items = [];
       if      (catalogId === "anime-popular")  items = await fetchPopular(page, search);
@@ -255,14 +317,11 @@ module.exports = async function handler(req, res) {
   const metaM = path.match(/^\/meta\/([^/]+)\/(.+)\.json$/);
   if (metaM) {
     const id = decodeURIComponent(metaM[2]);
-    console.log("[meta requested]", id);
-    if (!id.startsWith("al:")) {
-      console.log("[meta] skipping — not our prefix");
-      return res.status(200).json({ meta: null });
-    }
+    console.log("[meta]", id);
+    if (!id.startsWith("al:")) return res.status(200).json({ meta: null });
     try {
       const meta = await buildMeta(id);
-      console.log("[meta ok]", meta.name, "videos:", meta.videos?.length);
+      console.log("[meta ok]", meta.name, "| seasons:", new Set(meta.videos.map(v=>v.season)).size, "| episodes:", meta.videos.length);
       return res.status(200).json({ meta });
     } catch (e) {
       console.error("[meta error]", e.message);
