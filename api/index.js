@@ -248,10 +248,12 @@ async function buildMeta(rawId) {
     return meta;
   }
 
-  // Wiele części — każda = osobny sezon w Stremio
+  // Wiele części — filmy → sezon 0 ("Specials"), odcinki TV → sezon 1, 2, 3...
   const allVideos = [];
-  parts.forEach((part, idx) => {
-    const seasonNum = idx + 1;
+  let tvSeasonCounter = 1;
+  parts.forEach((part) => {
+    const isMovie = part.format === "MOVIE";
+    const seasonNum = isMovie ? 0 : tvSeasonCounter++;
     const eps = buildEpisodesForPart(part, seasonNum);
     allVideos.push(...eps);
   });
