@@ -1,0 +1,14 @@
+{
+  "name": "crunchyroll-anime-stremio-addon",
+  "version": "1.0.0",
+  "description": "Stremio addon – Crunchyroll Anime Catalog via AniList",
+  "main": "api/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {}
+}
