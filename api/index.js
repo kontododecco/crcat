@@ -83,7 +83,7 @@ const MEDIA_FIELDS = `
   coverImage { large extraLarge }
   bannerImage
   genres
-  startDate { year }
+  startDate { year month day }
   averageScore
   description(asHtml: false)
   episodes
@@ -136,7 +136,9 @@ async function getMeta(id) {
     `query($id:Int){Media(id:$id,type:ANIME){
       ${MEDIA_FIELDS}
       streamingEpisodes { title thumbnail url site }
-      relations { edges { relationType node { id title { romaji } type } } }
+      airingSchedule(notYetAired:false,perPage:50) {
+        nodes { episode airingAt }
+      }
     }}`,
     { id: anilistId }
   );
@@ -144,39 +146,70 @@ async function getMeta(id) {
   const media = data.Media;
   const meta = toStremioMeta(media);
 
-  // Build episode list
+  // Build a map: episodeNumber → airingAt timestamp
+  const airDates = {};
+  if (media.airingSchedule?.nodes) {
+    media.airingSchedule.nodes.forEach((node) => {
+      airDates[node.episode] = node.airingAt; // Unix timestamp
+    });
+  }
+
+  // Fallback release date when no airing data
+  const fallbackDate = media.startDate?.year
+    ? new Date(`${media.startDate.year}-01-01`).toISOString()
+    : new Date("2000-01-01").toISOString();
+
+  function getEpisodeDate(epNum) {
+    if (airDates[epNum]) {
+      return new Date(airDates[epNum] * 1000).toISOString();
+    }
+    // Estimate: fallback + epNum weeks offset
+    const base = media.startDate?.year
+      ? new Date(`${media.startDate.year}-${String(media.startDate.month || 1).padStart(2,"0")}-${String(media.startDate.day || 1).padStart(2,"0")}`)
+      : new Date("2000-01-01");
+    base.setDate(base.getDate() + (epNum - 1) * 7);
+    return base.toISOString();
+  }
+
   const videos = [];
 
   if (media.streamingEpisodes && media.streamingEpisodes.length > 0) {
-    // Use real episode data from AniList streaming info
+    // streamingEpisodes from AniList – real CR episode titles & thumbnails
     media.streamingEpisodes.forEach((ep, idx) => {
       const epNum = idx + 1;
       videos.push({
-        id: `anilist:${media.id}:${epNum}`,
+        id: `anilist:${media.id}:1:${epNum}`,   // format: prefix:metaId:season:ep
         title: ep.title || `Odcinek ${epNum}`,
         season: 1,
-        episode: epNum,
+        number: epNum,                            // NOTE: must be `number`, not `episode`
         thumbnail: ep.thumbnail || null,
-        // Link to Crunchyroll if available
+        released: getEpisodeDate(epNum),          // required by Stremio
         ...(ep.site === "Crunchyroll" ? { externalUrl: ep.url } : {}),
       });
     });
-  } else if (media.episodes) {
-    // Fallback: generate episode list from count
+  } else if (media.episodes && media.episodes > 0) {
+    // Fallback: generate list from total episode count
     for (let i = 1; i <= media.episodes; i++) {
       videos.push({
-        id: `anilist:${media.id}:${i}`,
+        id: `anilist:${media.id}:1:${i}`,
         title: `Odcinek ${i}`,
         season: 1,
-        episode: i,
+        number: i,                               // must be `number`
+        released: getEpisodeDate(i),             // required
       });
     }
+  } else {
+    // Still airing / unknown count – show placeholder episode 1
+    videos.push({
+      id: `anilist:${media.id}:1:1`,
+      title: "Odcinek 1",
+      season: 1,
+      number: 1,
+      released: fallbackDate,
+    });
   }
 
-  if (videos.length > 0) {
-    meta.videos = videos;
-  }
-
+  meta.videos = videos;
   return meta;
 }
 
